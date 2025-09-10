@@ -1,4 +1,4 @@
-﻿name: deploy-jdk-ssm
+name: deploy-jdk-ssm
 
 on:
   workflow_dispatch:
@@ -9,20 +9,21 @@ jobs:
   terraform_apply:
     runs-on: ubuntu-latest
     outputs:
-      instance_ids: ${{ steps.outputs_json.outputs_instance_ids }}
-      bucket: ${{ steps.outputs_json.outputs_bucket }}
-      s3_key: ${{ steps.outputs_json.outputs_key }}
+      instance_ids: ${{ steps.set_outputs.outputs.instance_ids }}
+      bucket: ${{ steps.set_outputs.outputs.bucket }}
+      s3_key: ${{ steps.set_outputs.outputs.s3_key }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v2
+        uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: 1.6.0
+          terraform_wrapper: false
 
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v2
+        uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
@@ -32,107 +33,164 @@ jobs:
         working-directory: terraform
         run: terraform init
 
-      - name: Ensure jq installed
-        run: sudo apt-get update -y && sudo apt-get install -y jq
+      - name: Terraform plan
+        working-directory: terraform
+        run: terraform plan -var="local_installer_path=${{ github.workspace }}/files/OpenJDK21U-jdk_x64_windows_hotspot_21.0.8_9.exe"
 
-      - name: Terraform apply (create infra and optionally upload installer)
+      - name: Terraform apply
         working-directory: terraform
         run: terraform apply -auto-approve -var="local_installer_path=${{ github.workspace }}/files/OpenJDK21U-jdk_x64_windows_hotspot_21.0.8_9.exe"
 
-      - name: Read terraform outputs (json) and set outputs
-        id: outputs_json
+      - name: Set job outputs from Terraform
+        id: set_outputs
         working-directory: terraform
         run: |
+          # Get outputs in JSON format
           terraform output -json > tfout.json
           cat tfout.json
-          # extract instance_ids as a JSON array string
-          INSTANCE_IDS=$(jq -c -r '.instance_ids.value' tfout.json)
-          BUCKET=$(jq -r '.s3_bucket.value' tfout.json)
-          # s3_key_list may be empty or not present; pick first or fallback key
-          S3_KEY=$(jq -r 'if (.s3_key_list? and (.s3_key_list.value | length) > 0) then .s3_key_list.value[0] elif (.s3_key? and .s3_key.value != null) then .s3_key.value else "installers/OpenJDK21U-jdk_x64_windows_hotspot_21.0.8_9.exe" end' tfout.json)
-          echo "outputs_instance_ids=$INSTANCE_IDS" >> $GITHUB_OUTPUT
-          echo "outputs_bucket=$BUCKET" >> $GITHUB_OUTPUT
-          echo "outputs_key=$S3_KEY" >> $GITHUB_OUTPUT
+          
+          # Extract and validate outputs
+          INSTANCE_IDS=$(terraform output -raw instance_ids 2>/dev/null || echo "[]")
+          BUCKET=$(terraform output -raw s3_bucket 2>/dev/null || echo "")
+          S3_KEY=$(terraform output -raw s3_key 2>/dev/null || terraform output -raw s3_key_list 2>/dev/null | jq -r '.[0] // "installers/OpenJDK21U-jdk_x64_windows_hotspot_21.0.8_9.exe"')
+          
+          # Validate that we have required outputs
+          if [ -z "$BUCKET" ]; then
+            echo "Error: S3 bucket output is empty"
+            exit 1
+          fi
+          
+          if [ "$INSTANCE_IDS" = "[]" ]; then
+            echo "Warning: No instance IDs found"
+          fi
+          
+          # Set outputs
+          echo "instance_ids=$INSTANCE_IDS" >> $GITHUB_OUTPUT
+          echo "bucket=$BUCKET" >> $GITHUB_OUTPUT
+          echo "s3_key=$S3_KEY" >> $GITHUB_OUTPUT
+          
+          # Debug output
+          echo "Instance IDs: $INSTANCE_IDS"
+          echo "Bucket: $BUCKET"
+          echo "S3 Key: $S3_KEY"
 
   generate_presigned_and_run_ansible:
     needs: terraform_apply
     runs-on: ubuntu-latest
+    if: ${{ needs.terraform_apply.outputs.instance_ids != '[]' && needs.terraform_apply.outputs.bucket != '' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v2
+        uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ secrets.AWS_REGION }}
 
-      - name: Prepare variables
-        run: |
-          echo "INST_RAW=${{ needs.terraform_apply.outputs.instance_ids }}" >> $GITHUB_ENV
-          echo "BUCKET=${{ needs.terraform_apply.outputs.bucket }}" >> $GITHUB_ENV
-          echo "KEY=${{ needs.terraform_apply.outputs.s3_key }}" >> $GITHUB_ENV
-          echo "EXPIRY=300" >> $GITHUB_ENV
-
-      - name: Ensure AWS CLI v2 available
-        run: |
-          aws --version || (curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip && unzip -q /tmp/awscliv2.zip -d /tmp && sudo /tmp/aws/install)
-
-      - name: Generate presigned URL (AWS CLI)
-        id: presign
-        env:
-          BUCKET: ${{ env.BUCKET }}
-          KEY: ${{ env.KEY }}
-          EXPIRY: ${{ env.EXPIRY }}
-        run: |
-          PRESIGNED=$(aws s3 presign "s3://$BUCKET/$KEY" --expires-in ${EXPIRY})
-          echo "PRESIGNED_URL=${PRESIGNED}" >> $GITHUB_ENV
-          echo "Presigned URL generated"
-
-      - name: Show instance ids (sanity)
-        run: echo "INST_RAW=$INST_RAW"
-        env:
-          INST_RAW: ${{ env.INST_RAW }}
-
-      - name: Setup Python and install deps
-        uses: actions/setup-python@v4
+      - name: Setup Python and install dependencies
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install Ansible and AWS deps
+      - name: Install Ansible and AWS dependencies
         run: |
           python -m pip install --upgrade pip
           pip install ansible boto3 botocore
           ansible-galaxy collection install amazon.aws
 
-      - name: Run Ansible playbook to install JDK via SSM
+      - name: Validate S3 object exists
+        env:
+          BUCKET: ${{ needs.terraform_apply.outputs.bucket }}
+          KEY: ${{ needs.terraform_apply.outputs.s3_key }}
+        run: |
+          if ! aws s3api head-object --bucket "$BUCKET" --key "$KEY" >/dev/null 2>&1; then
+            echo "Error: S3 object s3://$BUCKET/$KEY does not exist"
+            exit 1
+          fi
+          echo "S3 object validated: s3://$BUCKET/$KEY"
+
+      - name: Generate presigned URL
+        env:
+          BUCKET: ${{ needs.terraform_apply.outputs.bucket }}
+          KEY: ${{ needs.terraform_apply.outputs.s3_key }}
+          EXPIRY: 900  # 15 minutes
+        run: |
+          PRESIGNED_URL=$(aws s3 presign "s3://$BUCKET/$KEY" --expires-in $EXPIRY)
+          if [ -z "$PRESIGNED_URL" ]; then
+            echo "Error: Failed to generate presigned URL"
+            exit 1
+          fi
+          echo "PRESIGNED_URL=$PRESIGNED_URL" >> $GITHUB_ENV
+          echo "Presigned URL generated successfully"
+
+      - name: Normalize instance IDs
+        env:
+          INST_RAW: ${{ needs.terraform_apply.outputs.instance_ids }}
+        run: |
+          python3 -c "
+import os
+import json
+import sys
+
+raw = os.environ.get('INST_RAW', '[]')
+try:
+    # Try to parse as JSON directly
+    arr = json.loads(raw)
+    if not isinstance(arr, list):
+        arr = [arr]
+except json.JSONDecodeError:
+    try:
+        # Try to handle escaped JSON
+        cleaned = raw.strip('\"').replace('\\\"', '\"')
+        arr = json.loads(cleaned)
+        if not isinstance(arr, list):
+            arr = [arr]
+    except json.JSONDecodeError:
+        print(f'Error: Cannot parse instance IDs: {raw}', file=sys.stderr)
+        sys.exit(1)
+
+# Validate instance IDs format
+for inst_id in arr:
+    if not isinstance(inst_id, str) or not inst_id.startswith('i-'):
+        print(f'Error: Invalid instance ID format: {inst_id}', file=sys.stderr)
+        sys.exit(1)
+
+print(json.dumps(arr))
+" > inst_list.json
+          
+          INST_JSON=$(cat inst_list.json)
+          echo "INST_JSON=$INST_JSON" >> $GITHUB_ENV
+          echo "Normalized instance IDs: $INST_JSON"
+
+      - name: Run Ansible playbook via SSM
         env:
           PRESIGNED_URL: ${{ env.PRESIGNED_URL }}
           AWS_REGION: ${{ secrets.AWS_REGION }}
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          INST_RAW: ${{ env.INST_RAW }}
-          BUCKET: ${{ env.BUCKET }}
-          S3KEY: ${{ env.KEY }}
+          INST_JSON: ${{ env.INST_JSON }}
+          BUCKET: ${{ needs.terraform_apply.outputs.bucket }}
+          S3_KEY: ${{ needs.terraform_apply.outputs.s3_key }}
         run: |
-          # Normalize instance ids into JSON array for the playbook
-          python - <<'PY' > inst_list.json
-import os, json
-raw = os.environ.get('INST_RAW','[]')
-try:
-    arr = json.loads(raw)
-except Exception:
-    raw2 = raw.strip('"').replace('\\"','"')
-    arr = json.loads(raw2) if raw2 else []
-print(json.dumps(arr))
-PY
-          INST_JSON=$(cat inst_list.json)
-          echo "Running ansible playbook on instances: $INST_JSON"
+          # Validate Ansible playbook exists
+          if [ ! -f "ansible/ssm_install_jdk.yml" ]; then
+            echo "Error: Ansible playbook not found at ansible/ssm_install_jdk.yml"
+            exit 1
+          fi
+          
+          echo "Running Ansible playbook on instances: $INST_JSON"
+          
           ansible-playbook ansible/ssm_install_jdk.yml \
             -e "instance_ids=$INST_JSON" \
-            -e "s3_bucket=${BUCKET}" \
-            -e "s3_key=${S3KEY}" \
-            -e "presigned_url=${PRESIGNED_URL}" \
-            -e "aws_region=${{ secrets.AWS_REGION }}" \
+            -e "s3_bucket=$BUCKET" \
+            -e "s3_key=$S3_KEY" \
+            -e "presigned_url=$PRESIGNED_URL" \
+            -e "aws_region=$AWS_REGION" \
             -v
+
+      - name: Cleanup (optional)
+        if: always()
+        run: |
+          # Clean up temporary files
+          rm -f inst_list.json
+          echo "Cleanup completed"
