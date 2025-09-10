@@ -2,12 +2,23 @@ name: deploy-jdk-ssm
 
 on:
   workflow_dispatch:
+    inputs:
+      action:
+        description: 'Action to perform'
+        required: true
+        default: 'deploy'
+        type: choice
+        options:
+        - deploy
+        - verify
+        - destroy
   push:
     branches: [ main ]
 
 jobs:
   terraform_apply:
     runs-on: ubuntu-latest
+    if: ${{ github.event.inputs.action != 'destroy' }}
     outputs:
       instance_ids: ${{ steps.set_outputs.outputs.instance_ids }}
       bucket: ${{ steps.set_outputs.outputs.bucket }}
@@ -24,10 +35,8 @@ jobs:
           JDK_URL="https://github.com/adoptium/temurin21-binaries/releases/download/jdk-21.0.5%2B11/OpenJDK21U-jdk_x64_windows_hotspot_21.0.5_11.msi"
           JDK_FILE="files/OpenJDK21U-jdk_x64_windows_hotspot_21.0.8_9.exe"
           
-          # Download the latest available version (adjust URL as needed)
           curl -L -o "$JDK_FILE" "$JDK_URL"
           
-          # Verify file was downloaded
           if [ ! -f "$JDK_FILE" ]; then
             echo "Error: Failed to download JDK installer"
             exit 1
@@ -89,15 +98,11 @@ jobs:
           echo "instance_ids=$INSTANCE_IDS" >> $GITHUB_OUTPUT
           echo "bucket=$BUCKET" >> $GITHUB_OUTPUT
           echo "s3_key=$S3_KEY" >> $GITHUB_OUTPUT
-          
-          echo "Instance IDs: $INSTANCE_IDS"
-          echo "Bucket: $BUCKET"
-          echo "S3 Key: $S3_KEY"
 
-  generate_presigned_and_run_ansible:
+  install_java:
     needs: terraform_apply
     runs-on: ubuntu-latest
-    if: ${{ needs.terraform_apply.outputs.instance_ids != '[]' && needs.terraform_apply.outputs.bucket != '' }}
+    if: ${{ needs.terraform_apply.outputs.instance_ids != '[]' && needs.terraform_apply.outputs.bucket != '' && github.event.inputs.action != 'verify' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -143,7 +148,6 @@ jobs:
             exit 1
           fi
           echo "PRESIGNED_URL=$PRESIGNED_URL" >> $GITHUB_ENV
-          echo "Presigned URL generated successfully"
 
       - name: Normalize instance IDs
         env:
@@ -157,7 +161,6 @@ jobs:
           fi
           INST_JSON=$(cat inst_list.json)
           echo "INST_JSON=$INST_JSON" >> $GITHUB_ENV
-          echo "Normalized instance IDs: $INST_JSON"
 
       - name: Run Ansible playbook via SSM
         env:
@@ -172,8 +175,6 @@ jobs:
             exit 1
           fi
           
-          echo "Running Ansible playbook on instances: $INST_JSON"
-          
           ansible-playbook ansible/ssm_install_jdk.yml \
             -e "instance_ids=$INST_JSON" \
             -e "s3_bucket=$BUCKET" \
@@ -182,8 +183,137 @@ jobs:
             -e "aws_region=$AWS_REGION" \
             -v
 
-      - name: Cleanup
-        if: always()
+  verify_java:
+    needs: [terraform_apply, install_java]
+    runs-on: ubuntu-latest
+    if: ${{ always() && needs.terraform_apply.outputs.instance_ids != '[]' && (needs.install_java.result == 'success' || github.event.inputs.action == 'verify') }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Setup Python and install dependencies
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Ansible and AWS dependencies
         run: |
-          rm -f inst_list.json inst_raw.txt
-          echo "Cleanup completed"
+          python -m pip install --upgrade pip
+          pip install ansible boto3 botocore
+          ansible-galaxy collection install amazon.aws
+
+      - name: Get instance IDs for verification
+        id: get_instances
+        run: |
+          if [ "${{ github.event.inputs.action }}" = "verify" ]; then
+            # For manual verify, get instances from Terraform state
+            cd terraform
+            terraform init
+            INST_IDS=$(terraform output -raw instance_ids 2>/dev/null || echo "[]")
+          else
+            # Use from previous job
+            INST_IDS="${{ needs.terraform_apply.outputs.instance_ids }}"
+          fi
+          echo "INST_IDS=$INST_IDS" >> $GITHUB_ENV
+
+      - name: Verify Java installation
+        env:
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+          INST_IDS: ${{ env.INST_IDS }}
+        run: |
+          if [ ! -f "ansible/verify_java.yml" ]; then
+            echo "Creating Java verification playbook..."
+            cat > ansible/verify_java.yml << 'EOF'
+          ---
+          - name: Verify Java Installation
+            hosts: localhost
+            gather_facts: false
+            vars:
+              aws_region: "{{ aws_region }}"
+              instance_ids: "{{ instance_ids | from_json }}"
+            
+            tasks:
+              - name: Verify Java via SSM
+                amazon.aws.aws_ssm_send_command:
+                  region: "{{ aws_region }}"
+                  instance_ids: "{{ instance_ids }}"
+                  document_name: "AWS-RunPowerShellScript"
+                  parameters:
+                    commands:
+                      - |
+                        Write-Host "=== Java Verification Report ==="
+                        try {
+                          $version = java -version 2>&1 | Out-String
+                          Write-Host "✓ Java is installed and accessible"
+                          Write-Host "Version: $version"
+                        } catch {
+                          Write-Host "✗ Java is not installed or not in PATH"
+                          exit 1
+                        }
+                        
+                        $javaHome = [System.Environment]::GetEnvironmentVariable("JAVA_HOME", "Machine")
+                        if ($javaHome) {
+                          Write-Host "✓ JAVA_HOME is set to: $javaHome"
+                        } else {
+                          Write-Host "⚠ JAVA_HOME is not set"
+                        }
+                        
+                        Write-Host "=== Verification Complete ==="
+                  wait_for_results: true
+                  max_wait_time: 120
+                register: verification_result
+
+              - name: Show verification results
+                debug:
+                  msg: "Instance {{ item.instance_id }}: {{ item.status }} - {{ item.stdout }}"
+                loop: "{{ verification_result.invocations }}"
+          EOF
+          fi
+          
+          ansible-playbook ansible/verify_java.yml \
+            -e "instance_ids=$INST_IDS" \
+            -e "aws_region=$AWS_REGION" \
+            -v
+
+  terraform_destroy:
+    runs-on: ubuntu-latest
+    if: ${{ github.event.inputs.action == 'destroy' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.6.0
+          terraform_wrapper: false
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Terraform init
+        working-directory: terraform
+        run: terraform init
+
+      - name: Terraform destroy
+        working-directory: terraform
+        run: |
+          terraform destroy -auto-approve \
+            -var="local_installer_path=dummy_path" \
+            -var="admin_password=${{ secrets.ADMIN_PASSWORD }}"
+
+      - name: Cleanup verification
+        run: |
+          echo "All infrastructure has been destroyed"
+          echo "Verify in AWS console that all resources are removed"
