@@ -45,16 +45,13 @@ jobs:
         id: set_outputs
         working-directory: terraform
         run: |
-          # Get outputs in JSON format
           terraform output -json > tfout.json
           cat tfout.json
           
-          # Extract and validate outputs
           INSTANCE_IDS=$(terraform output -raw instance_ids 2>/dev/null || echo "[]")
           BUCKET=$(terraform output -raw s3_bucket 2>/dev/null || echo "")
           S3_KEY=$(terraform output -raw s3_key 2>/dev/null || terraform output -raw s3_key_list 2>/dev/null | jq -r '.[0] // "installers/OpenJDK21U-jdk_x64_windows_hotspot_21.0.8_9.exe"')
           
-          # Validate that we have required outputs
           if [ -z "$BUCKET" ]; then
             echo "Error: S3 bucket output is empty"
             exit 1
@@ -64,12 +61,10 @@ jobs:
             echo "Warning: No instance IDs found"
           fi
           
-          # Set outputs
           echo "instance_ids=$INSTANCE_IDS" >> $GITHUB_OUTPUT
           echo "bucket=$BUCKET" >> $GITHUB_OUTPUT
           echo "s3_key=$S3_KEY" >> $GITHUB_OUTPUT
           
-          # Debug output
           echo "Instance IDs: $INSTANCE_IDS"
           echo "Bucket: $BUCKET"
           echo "S3 Key: $S3_KEY"
@@ -115,7 +110,7 @@ jobs:
         env:
           BUCKET: ${{ needs.terraform_apply.outputs.bucket }}
           KEY: ${{ needs.terraform_apply.outputs.s3_key }}
-          EXPIRY: 900  # 15 minutes
+          EXPIRY: 900
         run: |
           PRESIGNED_URL=$(aws s3 presign "s3://$BUCKET/$KEY" --expires-in $EXPIRY)
           if [ -z "$PRESIGNED_URL" ]; then
@@ -129,38 +124,12 @@ jobs:
         env:
           INST_RAW: ${{ needs.terraform_apply.outputs.instance_ids }}
         run: |
-          cat > normalize_instances.py << 'EOF'
-import os
-import json
-import sys
-
-raw = os.environ.get('INST_RAW', '[]')
-try:
-    # Try to parse as JSON directly
-    arr = json.loads(raw)
-    if not isinstance(arr, list):
-        arr = [arr]
-except json.JSONDecodeError:
-    try:
-        # Try to handle escaped JSON
-        cleaned = raw.strip('"').replace('\\"', '"')
-        arr = json.loads(cleaned)
-        if not isinstance(arr, list):
-            arr = [arr]
-    except json.JSONDecodeError:
-        print(f'Error: Cannot parse instance IDs: {raw}', file=sys.stderr)
-        sys.exit(1)
-
-# Validate instance IDs format
-for inst_id in arr:
-    if not isinstance(inst_id, str) or not inst_id.startswith('i-'):
-        print(f'Error: Invalid instance ID format: {inst_id}', file=sys.stderr)
-        sys.exit(1)
-
-print(json.dumps(arr))
-EOF
-          
-          python3 normalize_instances.py > inst_list.json
+          echo "$INST_RAW" > inst_raw.txt
+          if echo "$INST_RAW" | jq -e . >/dev/null 2>&1; then
+            echo "$INST_RAW" | jq -c '.' > inst_list.json
+          else
+            echo '[]' > inst_list.json
+          fi
           INST_JSON=$(cat inst_list.json)
           echo "INST_JSON=$INST_JSON" >> $GITHUB_ENV
           echo "Normalized instance IDs: $INST_JSON"
@@ -173,7 +142,6 @@ EOF
           BUCKET: ${{ needs.terraform_apply.outputs.bucket }}
           S3_KEY: ${{ needs.terraform_apply.outputs.s3_key }}
         run: |
-          # Validate Ansible playbook exists
           if [ ! -f "ansible/ssm_install_jdk.yml" ]; then
             echo "Error: Ansible playbook not found at ansible/ssm_install_jdk.yml"
             exit 1
@@ -189,9 +157,8 @@ EOF
             -e "aws_region=$AWS_REGION" \
             -v
 
-      - name: Cleanup (optional)
+      - name: Cleanup
         if: always()
         run: |
-          # Clean up temporary files
-          rm -f inst_list.json
+          rm -f inst_list.json inst_raw.txt
           echo "Cleanup completed"
