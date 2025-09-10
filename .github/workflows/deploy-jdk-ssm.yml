@@ -1,4 +1,4 @@
-name: deploy-jdk-ssm
+name: deploy-jdk-complete
 
 on:
   workflow_dispatch:
@@ -15,16 +15,21 @@ on:
   push:
     branches: [ main ]
 
+env:
+  TF_VERSION: "1.6.0"
+  PYTHON_VERSION: "3.11"
+  JDK_VERSION: "21.0.5_11"
+
 jobs:
   terraform_apply:
     runs-on: ubuntu-latest
-    if: ${{ github.event.inputs.action != 'destroy' }}
+    if: ${{ (github.event.inputs.action == 'deploy' || github.event.inputs.action == 'verify' || github.event_name == 'push') }}
     outputs:
-      instance_ids: ${{ steps.set_outputs.outputs.instance_ids }}
-      bucket: ${{ steps.set_outputs.outputs.bucket }}
-      s3_key: ${{ steps.set_outputs.outputs.s3_key }}
+      instance_ids: ${{ steps.outputs.outputs.instance_ids }}
+      bucket: ${{ steps.outputs.outputs.bucket }}
+      s3_key: ${{ steps.outputs.outputs.s3_key }}
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Create files directory
@@ -33,21 +38,22 @@ jobs:
       - name: Download OpenJDK installer
         run: |
           JDK_URL="https://github.com/adoptium/temurin21-binaries/releases/download/jdk-21.0.5%2B11/OpenJDK21U-jdk_x64_windows_hotspot_21.0.5_11.msi"
-          JDK_FILE="files/OpenJDK21U-jdk_x64_windows_hotspot_21.0.8_9.exe"
+          JDK_FILE="files/OpenJDK21U-jdk_x64_windows_hotspot_21.0.5_11.msi"
           
+          echo "📥 Downloading JDK installer..."
           curl -L -o "$JDK_FILE" "$JDK_URL"
           
           if [ ! -f "$JDK_FILE" ]; then
-            echo "Error: Failed to download JDK installer"
+            echo "❌ Error: Failed to download JDK installer"
             exit 1
           fi
           
-          echo "Downloaded JDK installer: $(ls -lh $JDK_FILE)"
+          echo "✅ Downloaded JDK installer: $(ls -lh $JDK_FILE)"
 
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
         with:
-          terraform_version: 1.6.0
+          terraform_version: ${{ env.TF_VERSION }}
           terraform_wrapper: false
 
       - name: Configure AWS credentials
@@ -59,42 +65,60 @@ jobs:
 
       - name: Terraform init
         working-directory: terraform
-        run: terraform init
+        run: |
+          echo "🚀 Initializing Terraform..."
+          terraform init
+
+      - name: Terraform validate
+        working-directory: terraform
+        run: |
+          echo "✅ Validating Terraform configuration..."
+          terraform validate
 
       - name: Terraform plan
         working-directory: terraform
         run: |
+          echo "📋 Creating Terraform plan..."
           terraform plan \
-            -var="local_installer_path=${{ github.workspace }}/files/OpenJDK21U-jdk_x64_windows_hotspot_21.0.8_9.exe" \
-            -var="admin_password=${{ secrets.ADMIN_PASSWORD }}"
+            -var="local_installer_path=${{ github.workspace }}/files/OpenJDK21U-jdk_x64_windows_hotspot_21.0.5_11.msi" \
+            -var="admin_password=${{ secrets.ADMIN_PASSWORD }}" \
+            -out=tfplan
 
       - name: Terraform apply
         working-directory: terraform
         run: |
-          terraform apply -auto-approve \
-            -var="local_installer_path=${{ github.workspace }}/files/OpenJDK21U-jdk_x64_windows_hotspot_21.0.8_9.exe" \
-            -var="admin_password=${{ secrets.ADMIN_PASSWORD }}"
+          echo "🏗️ Applying Terraform configuration..."
+          terraform apply -auto-approve tfplan
 
-      - name: Set job outputs from Terraform
-        id: set_outputs
+      - name: Extract Terraform outputs
+        id: outputs
         working-directory: terraform
         run: |
-          terraform output -json > tfout.json
-          cat tfout.json
+          echo "📤 Extracting Terraform outputs..."
+          terraform output -json > terraform_outputs.json
+          cat terraform_outputs.json
           
-          INSTANCE_IDS=$(terraform output -raw instance_ids 2>/dev/null || echo "[]")
+          # Extract outputs with proper error handling
+          INSTANCE_IDS=$(terraform output -json instance_ids 2>/dev/null | jq -c '.' || echo '[]')
           BUCKET=$(terraform output -raw s3_bucket 2>/dev/null || echo "")
-          S3_KEY=$(terraform output -raw s3_key 2>/dev/null || terraform output -raw s3_key_list 2>/dev/null | jq -r '.[0] // "installers/OpenJDK21U-jdk_x64_windows_hotspot_21.0.8_9.exe"')
+          S3_KEY=$(terraform output -raw s3_key 2>/dev/null || echo "installers/OpenJDK21U-jdk_x64_windows_hotspot_21.0.5_11.msi")
           
+          echo "🔍 Debug outputs:"
+          echo "  Instance IDs: $INSTANCE_IDS"
+          echo "  S3 Bucket: $BUCKET"
+          echo "  S3 Key: $S3_KEY"
+          
+          # Validation
           if [ -z "$BUCKET" ]; then
-            echo "Error: S3 bucket output is empty"
+            echo "❌ Error: S3 bucket output is empty"
             exit 1
           fi
           
-          if [ "$INSTANCE_IDS" = "[]" ]; then
-            echo "Warning: No instance IDs found"
+          if [ "$INSTANCE_IDS" = "[]" ] || [ -z "$INSTANCE_IDS" ]; then
+            echo "⚠️ Warning: No instance IDs found"
           fi
           
+          # Set outputs
           echo "instance_ids=$INSTANCE_IDS" >> $GITHUB_OUTPUT
           echo "bucket=$BUCKET" >> $GITHUB_OUTPUT
           echo "s3_key=$S3_KEY" >> $GITHUB_OUTPUT
@@ -102,9 +126,19 @@ jobs:
   install_java:
     needs: terraform_apply
     runs-on: ubuntu-latest
-    if: ${{ needs.terraform_apply.outputs.instance_ids != '[]' && needs.terraform_apply.outputs.bucket != '' && github.event.inputs.action != 'verify' }}
+    if: ${{ needs.terraform_apply.result == 'success' && needs.terraform_apply.outputs.instance_ids != '[]' && needs.terraform_apply.outputs.bucket != '' && github.event.inputs.action == 'deploy' }}
     steps:
-      - name: Checkout
+      - name: Debug job inputs
+        run: |
+          echo "🐛 Debug Information:"
+          echo "  Action: ${{ github.event.inputs.action }}"
+          echo "  Event: ${{ github.event_name }}"
+          echo "  Terraform result: ${{ needs.terraform_apply.result }}"
+          echo "  Instance IDs: ${{ needs.terraform_apply.outputs.instance_ids }}"
+          echo "  Bucket: ${{ needs.terraform_apply.outputs.bucket }}"
+          echo "  S3 Key: ${{ needs.terraform_apply.outputs.s3_key }}"
+
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Configure AWS credentials
@@ -114,69 +148,186 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ secrets.AWS_REGION }}
 
-      - name: Setup Python and install dependencies
+      - name: Setup Python and dependencies
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: ${{ env.PYTHON_VERSION }}
 
       - name: Install Ansible and AWS dependencies
         run: |
+          echo "📦 Installing Ansible and dependencies..."
           python -m pip install --upgrade pip
           pip install ansible boto3 botocore
           ansible-galaxy collection install amazon.aws
 
-      - name: Validate S3 object exists
+      - name: Validate S3 object
         env:
           BUCKET: ${{ needs.terraform_apply.outputs.bucket }}
           KEY: ${{ needs.terraform_apply.outputs.s3_key }}
         run: |
+          echo "🔍 Validating S3 object exists..."
           if ! aws s3api head-object --bucket "$BUCKET" --key "$KEY" >/dev/null 2>&1; then
-            echo "Error: S3 object s3://$BUCKET/$KEY does not exist"
+            echo "❌ Error: S3 object s3://$BUCKET/$KEY does not exist"
+            aws s3 ls s3://$BUCKET/ || echo "Bucket listing failed"
             exit 1
           fi
-          echo "S3 object validated: s3://$BUCKET/$KEY"
+          echo "✅ S3 object validated: s3://$BUCKET/$KEY"
 
       - name: Generate presigned URL
         env:
           BUCKET: ${{ needs.terraform_apply.outputs.bucket }}
           KEY: ${{ needs.terraform_apply.outputs.s3_key }}
-          EXPIRY: 900
         run: |
-          PRESIGNED_URL=$(aws s3 presign "s3://$BUCKET/$KEY" --expires-in $EXPIRY)
+          echo "🔗 Generating presigned URL..."
+          PRESIGNED_URL=$(aws s3 presign "s3://$BUCKET/$KEY" --expires-in 900)
           if [ -z "$PRESIGNED_URL" ]; then
-            echo "Error: Failed to generate presigned URL"
+            echo "❌ Error: Failed to generate presigned URL"
             exit 1
           fi
           echo "PRESIGNED_URL=$PRESIGNED_URL" >> $GITHUB_ENV
+          echo "✅ Presigned URL generated successfully"
 
-      - name: Normalize instance IDs
-        env:
-          INST_RAW: ${{ needs.terraform_apply.outputs.instance_ids }}
+      - name: Create Ansible playbook if missing
         run: |
-          echo "$INST_RAW" > inst_raw.txt
-          if echo "$INST_RAW" | jq -e . >/dev/null 2>&1; then
-            echo "$INST_RAW" | jq -c '.' > inst_list.json
-          else
-            echo '[]' > inst_list.json
-          fi
-          INST_JSON=$(cat inst_list.json)
-          echo "INST_JSON=$INST_JSON" >> $GITHUB_ENV
+          if [ ! -f "ansible/ssm_install_jdk.yml" ]; then
+            echo "📝 Creating missing Ansible playbook..."
+            mkdir -p ansible
+            cat > ansible/ssm_install_jdk.yml << 'EOF'
+          ---
+          - name: Install JDK via SSM on Windows instances
+            hosts: localhost
+            gather_facts: false
+            vars:
+              aws_region: "{{ aws_region }}"
+              instance_ids: "{{ instance_ids | from_json }}"
+              s3_bucket: "{{ s3_bucket }}"
+              s3_key: "{{ s3_key }}"
+              presigned_url: "{{ presigned_url }}"
+              
+            tasks:
+              - name: Display installation parameters
+                debug:
+                  msg:
+                    - "Installing JDK on instances: {{ instance_ids }}"
+                    - "S3 location: s3://{{ s3_bucket }}/{{ s3_key }}"
+                    - "AWS Region: {{ aws_region }}"
 
-      - name: Run Ansible playbook via SSM
+              - name: Install JDK via SSM
+                amazon.aws.aws_ssm_send_command:
+                  region: "{{ aws_region }}"
+                  instance_ids: "{{ instance_ids }}"
+                  document_name: "AWS-RunPowerShellScript"
+                  parameters:
+                    commands:
+                      - |
+                        Write-Host "=== JDK Installation Started ==="
+                        Write-Host "Timestamp: $(Get-Date)"
+                        
+                        # Set variables
+                        $downloadUrl = "{{ presigned_url }}"
+                        $installerPath = "C:\temp\jdk_installer.msi"
+                        $logPath = "C:\temp\jdk_install.log"
+                        
+                        # Create temp directory
+                        if (-not (Test-Path "C:\temp")) {
+                            New-Item -ItemType Directory -Path "C:\temp" -Force
+                        }
+                        
+                        try {
+                            # Download JDK installer
+                            Write-Host "📥 Downloading JDK installer..."
+                            Invoke-WebRequest -Uri $downloadUrl -OutFile $installerPath -UseBasicParsing
+                            
+                            if (-not (Test-Path $installerPath)) {
+                                throw "Downloaded installer not found"
+                            }
+                            
+                            Write-Host "✅ Download completed: $(Get-Item $installerPath | Select-Object Name, Length)"
+                            
+                            # Install JDK silently
+                            Write-Host "🔧 Installing JDK..."
+                            $installArgs = @(
+                                "/i", $installerPath,
+                                "/quiet",
+                                "/norestart",
+                                "/log", $logPath,
+                                "ADDLOCAL=FeatureMain,FeatureEnvironment,FeatureJarFileRunWith,FeatureJavaHome"
+                            )
+                            
+                            $process = Start-Process -FilePath "msiexec.exe" -ArgumentList $installArgs -Wait -PassThru
+                            
+                            if ($process.ExitCode -eq 0) {
+                                Write-Host "✅ JDK installation completed successfully"
+                            } else {
+                                Write-Host "❌ JDK installation failed with exit code: $($process.ExitCode)"
+                                if (Test-Path $logPath) {
+                                    Write-Host "Installation log:"
+                                    Get-Content $logPath | Select-Object -Last 20
+                                }
+                                throw "Installation failed"
+                            }
+                            
+                            # Verify installation
+                            Write-Host "🔍 Verifying installation..."
+                            
+                            # Refresh environment variables
+                            $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
+                            
+                            # Test Java command
+                            $javaVersion = & java -version 2>&1 | Out-String
+                            Write-Host "Java version output: $javaVersion"
+                            
+                            # Check JAVA_HOME
+                            $javaHome = [System.Environment]::GetEnvironmentVariable("JAVA_HOME", "Machine")
+                            if ($javaHome) {
+                                Write-Host "✅ JAVA_HOME set to: $javaHome"
+                            } else {
+                                Write-Host "⚠️ JAVA_HOME not set"
+                            }
+                            
+                            Write-Host "=== Installation Complete ==="
+                            
+                        } catch {
+                            Write-Host "❌ Installation failed: $($_.Exception.Message)"
+                            if (Test-Path $logPath) {
+                                Write-Host "Installation log:"
+                                Get-Content $logPath
+                            }
+                            throw
+                        } finally {
+                            # Cleanup
+                            if (Test-Path $installerPath) {
+                                Remove-Item $installerPath -Force
+                            }
+                        }
+                  wait_for_results: true
+                  max_wait_time: 600
+                register: install_result
+
+              - name: Display installation results
+                debug:
+                  msg: "Instance {{ item.instance_id }}: {{ item.status }} - {{ item.stdout if item.stdout else 'No output' }}"
+                loop: "{{ install_result.invocations }}"
+
+              - name: Check for installation failures
+                fail:
+                  msg: "JDK installation failed on one or more instances"
+                when: install_result.invocations | selectattr('status', 'equalto', 'Failed') | list | length > 0
+          EOF
+            echo "✅ Ansible playbook created"
+          fi
+
+      - name: Run JDK installation
         env:
           PRESIGNED_URL: ${{ env.PRESIGNED_URL }}
           AWS_REGION: ${{ secrets.AWS_REGION }}
-          INST_JSON: ${{ env.INST_JSON }}
+          INSTANCE_IDS: ${{ needs.terraform_apply.outputs.instance_ids }}
           BUCKET: ${{ needs.terraform_apply.outputs.bucket }}
           S3_KEY: ${{ needs.terraform_apply.outputs.s3_key }}
         run: |
-          if [ ! -f "ansible/ssm_install_jdk.yml" ]; then
-            echo "Error: Ansible playbook not found at ansible/ssm_install_jdk.yml"
-            exit 1
-          fi
-          
+          echo "🚀 Starting JDK installation via SSM..."
           ansible-playbook ansible/ssm_install_jdk.yml \
-            -e "instance_ids=$INST_JSON" \
+            -e "instance_ids=$INSTANCE_IDS" \
             -e "s3_bucket=$BUCKET" \
             -e "s3_key=$S3_KEY" \
             -e "presigned_url=$PRESIGNED_URL" \
@@ -186,9 +337,17 @@ jobs:
   verify_java:
     needs: [terraform_apply, install_java]
     runs-on: ubuntu-latest
-    if: ${{ always() && needs.terraform_apply.outputs.instance_ids != '[]' && (needs.install_java.result == 'success' || github.event.inputs.action == 'verify') }}
+    if: ${{ always() && needs.terraform_apply.result == 'success' && needs.terraform_apply.outputs.instance_ids != '[]' && (needs.install_java.result == 'success' || github.event.inputs.action == 'verify') }}
     steps:
-      - name: Checkout
+      - name: Debug job inputs
+        run: |
+          echo "🐛 Verification Debug:"
+          echo "  Action: ${{ github.event.inputs.action }}"
+          echo "  Terraform result: ${{ needs.terraform_apply.result }}"
+          echo "  Install result: ${{ needs.install_java.result }}"
+          echo "  Instance IDs: ${{ needs.terraform_apply.outputs.instance_ids }}"
+
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Configure AWS credentials
@@ -198,13 +357,14 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ secrets.AWS_REGION }}
 
-      - name: Setup Python and install dependencies
+      - name: Setup Python and dependencies
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: ${{ env.PYTHON_VERSION }}
 
       - name: Install Ansible and AWS dependencies
         run: |
+          echo "📦 Installing Ansible and dependencies..."
           python -m pip install --upgrade pip
           pip install ansible boto3 botocore
           ansible-galaxy collection install amazon.aws
@@ -213,24 +373,21 @@ jobs:
         id: get_instances
         run: |
           if [ "${{ github.event.inputs.action }}" = "verify" ]; then
-            # For manual verify, get instances from Terraform state
+            echo "Getting instances from Terraform state..."
             cd terraform
             terraform init
-            INST_IDS=$(terraform output -raw instance_ids 2>/dev/null || echo "[]")
+            INST_IDS=$(terraform output -json instance_ids 2>/dev/null | jq -c '.' || echo '[]')
           else
-            # Use from previous job
             INST_IDS="${{ needs.terraform_apply.outputs.instance_ids }}"
           fi
           echo "INST_IDS=$INST_IDS" >> $GITHUB_ENV
+          echo "Instance IDs for verification: $INST_IDS"
 
-      - name: Verify Java installation
-        env:
-          AWS_REGION: ${{ secrets.AWS_REGION }}
-          INST_IDS: ${{ env.INST_IDS }}
+      - name: Create verification playbook
         run: |
-          if [ ! -f "ansible/verify_java.yml" ]; then
-            echo "Creating Java verification playbook..."
-            cat > ansible/verify_java.yml << 'EOF'
+          echo "📝 Creating Java verification playbook..."
+          mkdir -p ansible
+          cat > ansible/verify_java.yml << 'EOF'
           ---
           - name: Verify Java Installation
             hosts: localhost
@@ -240,7 +397,7 @@ jobs:
               instance_ids: "{{ instance_ids | from_json }}"
             
             tasks:
-              - name: Verify Java via SSM
+              - name: Verify Java installation via SSM
                 amazon.aws.aws_ssm_send_command:
                   region: "{{ aws_region }}"
                   instance_ids: "{{ instance_ids }}"
@@ -249,34 +406,96 @@ jobs:
                     commands:
                       - |
                         Write-Host "=== Java Verification Report ==="
+                        Write-Host "Timestamp: $(Get-Date)"
+                        Write-Host "Computer: $env:COMPUTERNAME"
+                        Write-Host ""
+                        
+                        $verificationPassed = $true
+                        
                         try {
-                          $version = java -version 2>&1 | Out-String
-                          Write-Host "✓ Java is installed and accessible"
-                          Write-Host "Version: $version"
+                            # Test Java command
+                            Write-Host "🔍 Testing Java command..."
+                            $javaVersionOutput = & java -version 2>&1
+                            if ($LASTEXITCODE -eq 0) {
+                                Write-Host "✅ Java command is accessible"
+                                Write-Host "Version output:"
+                                $javaVersionOutput | ForEach-Object { Write-Host "  $_" }
+                            } else {
+                                Write-Host "❌ Java command failed"
+                                $verificationPassed = $false
+                            }
                         } catch {
-                          Write-Host "✗ Java is not installed or not in PATH"
-                          exit 1
+                            Write-Host "❌ Java command not found in PATH"
+                            $verificationPassed = $false
                         }
                         
+                        # Check JAVA_HOME
+                        Write-Host ""
+                        Write-Host "🔍 Checking JAVA_HOME..."
                         $javaHome = [System.Environment]::GetEnvironmentVariable("JAVA_HOME", "Machine")
                         if ($javaHome) {
-                          Write-Host "✓ JAVA_HOME is set to: $javaHome"
+                            Write-Host "✅ JAVA_HOME is set to: $javaHome"
+                            if (Test-Path "$javaHome\bin\java.exe") {
+                                Write-Host "✅ Java executable found in JAVA_HOME"
+                            } else {
+                                Write-Host "⚠️ Java executable NOT found in JAVA_HOME"
+                                $verificationPassed = $false
+                            }
                         } else {
-                          Write-Host "⚠ JAVA_HOME is not set"
+                            Write-Host "⚠️ JAVA_HOME environment variable is not set"
                         }
                         
-                        Write-Host "=== Verification Complete ==="
+                        # Check PATH
+                        Write-Host ""
+                        Write-Host "🔍 Checking PATH for Java..."
+                        $pathDirs = $env:PATH -split ';'
+                        $javaInPath = $false
+                        foreach ($dir in $pathDirs) {
+                            if ($dir -and (Test-Path "$dir\java.exe")) {
+                                Write-Host "✅ Java found in PATH: $dir"
+                                $javaInPath = $true
+                                break
+                            }
+                        }
+                        if (-not $javaInPath) {
+                            Write-Host "⚠️ Java not found in PATH"
+                        }
+                        
+                        # Final result
+                        Write-Host ""
+                        Write-Host "=== Verification Summary ==="
+                        if ($verificationPassed) {
+                            Write-Host "✅ PASS: Java is properly installed and configured"
+                        } else {
+                            Write-Host "❌ FAIL: Java installation has issues"
+                            exit 1
+                        }
+                        Write-Host "=== End of Report ==="
                   wait_for_results: true
                   max_wait_time: 120
                 register: verification_result
 
-              - name: Show verification results
+              - name: Display verification results
                 debug:
-                  msg: "Instance {{ item.instance_id }}: {{ item.status }} - {{ item.stdout }}"
+                  msg: |
+                    Instance: {{ item.instance_id }}
+                    Status: {{ item.status }}
+                    Output: {{ item.stdout | default('No output') }}
+                    {% if item.stderr %}Error: {{ item.stderr }}{% endif %}
                 loop: "{{ verification_result.invocations }}"
+
+              - name: Check verification status
+                fail:
+                  msg: "Java verification failed on one or more instances"
+                when: verification_result.invocations | selectattr('status', 'equalto', 'Failed') | list | length > 0
           EOF
-          fi
-          
+
+      - name: Run Java verification
+        env:
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+          INST_IDS: ${{ env.INST_IDS }}
+        run: |
+          echo "🔍 Starting Java verification..."
           ansible-playbook ansible/verify_java.yml \
             -e "instance_ids=$INST_IDS" \
             -e "aws_region=$AWS_REGION" \
@@ -286,13 +505,13 @@ jobs:
     runs-on: ubuntu-latest
     if: ${{ github.event.inputs.action == 'destroy' }}
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
         with:
-          terraform_version: 1.6.0
+          terraform_version: ${{ env.TF_VERSION }}
           terraform_wrapper: false
 
       - name: Configure AWS credentials
@@ -304,16 +523,33 @@ jobs:
 
       - name: Terraform init
         working-directory: terraform
-        run: terraform init
+        run: |
+          echo "🚀 Initializing Terraform for destroy..."
+          terraform init
+
+      - name: Show destroy plan
+        working-directory: terraform
+        run: |
+          echo "📋 Showing what will be destroyed..."
+          terraform plan -destroy \
+            -var="local_installer_path=dummy_path" \
+            -var="admin_password=${{ secrets.ADMIN_PASSWORD }}"
 
       - name: Terraform destroy
         working-directory: terraform
         run: |
+          echo "🗑️ Destroying infrastructure..."
           terraform destroy -auto-approve \
             -var="local_installer_path=dummy_path" \
             -var="admin_password=${{ secrets.ADMIN_PASSWORD }}"
 
       - name: Cleanup verification
         run: |
-          echo "All infrastructure has been destroyed"
-          echo "Verify in AWS console that all resources are removed"
+          echo "✅ Infrastructure destruction completed!"
+          echo ""
+          echo "🔍 Please verify in AWS Console that these resources are removed:"
+          echo "  • EC2 instances"
+          echo "  • S3 buckets and objects"
+          echo "  • IAM roles and policies"
+          echo "  • Security groups"
+          echo "  • VPC and networking components"
