@@ -35,11 +35,17 @@ jobs:
 
       - name: Terraform plan
         working-directory: terraform
-        run: terraform plan -var="local_installer_path=${{ github.workspace }}/files/OpenJDK21U-jdk_x64_windows_hotspot_21.0.8_9.exe"
+        run: |
+          terraform plan \
+            -var="local_installer_path=${{ github.workspace }}/files/OpenJDK21U-jdk_x64_windows_hotspot_21.0.8_9.exe" \
+            -var="admin_password=${{ secrets.ADMIN_PASSWORD }}"
 
       - name: Terraform apply
         working-directory: terraform
-        run: terraform apply -auto-approve -var="local_installer_path=${{ github.workspace }}/files/OpenJDK21U-jdk_x64_windows_hotspot_21.0.8_9.exe"
+        run: |
+          terraform apply -auto-approve \
+            -var="local_installer_path=${{ github.workspace }}/files/OpenJDK21U-jdk_x64_windows_hotspot_21.0.8_9.exe" \
+            -var="admin_password=${{ secrets.ADMIN_PASSWORD }}"
 
       - name: Set job outputs from Terraform
         id: set_outputs
