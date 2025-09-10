@@ -69,6 +69,51 @@ jobs:
           echo "🚀 Initializing Terraform..."
           terraform init
 
+      - name: Import existing resources if they exist
+        working-directory: terraform
+        continue-on-error: true
+        run: |
+          echo "🔍 Checking and importing existing resources..."
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          
+          # Import IAM Policy if exists
+          if aws iam get-policy --policy-arn "arn:aws:iam::${ACCOUNT_ID}:policy/InstanceS3GetJdkPolicy" >/dev/null 2>&1; then
+            echo "📥 Importing existing IAM policy..."
+            terraform import aws_iam_policy.s3_get_policy "arn:aws:iam::${ACCOUNT_ID}:policy/InstanceS3GetJdkPolicy" || echo "Policy import failed or already in state"
+          else
+            echo "IAM policy not found, will be created"
+          fi
+          
+          # Import IAM Role if exists
+          if aws iam get-role --role-name "ec2-ssm-jdk-role" >/dev/null 2>&1; then
+            echo "📥 Importing existing IAM role..."
+            terraform import aws_iam_role.ec2_role "ec2-ssm-jdk-role" || echo "Role import failed or already in state"
+          else
+            echo "IAM role not found, will be created"
+          fi
+          
+          # Import Instance Profile if exists
+          if aws iam get-instance-profile --instance-profile-name "ec2-ssm-jdk-instance-profile" >/dev/null 2>&1; then
+            echo "📥 Importing existing instance profile..."
+            terraform import aws_iam_instance_profile.ec2_profile "ec2-ssm-jdk-instance-profile" || echo "Instance profile import failed or already in state"
+          else
+            echo "Instance profile not found, will be created"
+          fi
+          
+          # Import policy attachments if they exist
+          if aws iam list-attached-role-policies --role-name "ec2-ssm-jdk-role" --query 'AttachedPolicies[?PolicyName==`AmazonSSMManagedInstanceCore`]' --output text 2>/dev/null | grep -q "AmazonSSMManagedInstanceCore"; then
+            echo "📥 Importing SSM policy attachment..."
+            terraform import aws_iam_role_policy_attachment.ssm_managed "ec2-ssm-jdk-role/arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore" || echo "SSM policy attachment import failed or already in state"
+          fi
+          
+          # Import custom policy attachment if exists
+          if aws iam list-attached-role-policies --role-name "ec2-ssm-jdk-role" --query 'AttachedPolicies[?PolicyName==`InstanceS3GetJdkPolicy`]' --output text 2>/dev/null | grep -q "InstanceS3GetJdkPolicy"; then
+            echo "📥 Importing custom policy attachment..."
+            terraform import aws_iam_role_policy_attachment.attach_s3_get "ec2-ssm-jdk-role/arn:aws:iam::${ACCOUNT_ID}:policy/InstanceS3GetJdkPolicy" || echo "Custom policy attachment import failed or already in state"
+          fi
+          
+          echo "✅ Import process completed"
+
       - name: Terraform validate
         working-directory: terraform
         run: |
