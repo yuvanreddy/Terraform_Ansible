@@ -129,7 +129,7 @@ jobs:
         env:
           INST_RAW: ${{ needs.terraform_apply.outputs.instance_ids }}
         run: |
-          python3 -c "
+          cat > normalize_instances.py << 'EOF'
 import os
 import json
 import sys
@@ -143,7 +143,7 @@ try:
 except json.JSONDecodeError:
     try:
         # Try to handle escaped JSON
-        cleaned = raw.strip('\"').replace('\\\"', '\"')
+        cleaned = raw.strip('"').replace('\\"', '"')
         arr = json.loads(cleaned)
         if not isinstance(arr, list):
             arr = [arr]
@@ -158,8 +158,9 @@ for inst_id in arr:
         sys.exit(1)
 
 print(json.dumps(arr))
-" > inst_list.json
+EOF
           
+          python3 normalize_instances.py > inst_list.json
           INST_JSON=$(cat inst_list.json)
           echo "INST_JSON=$INST_JSON" >> $GITHUB_ENV
           echo "Normalized instance IDs: $INST_JSON"
