@@ -1,0 +1,58 @@
+name: destroy-infrastructure
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type "destroy" to confirm'
+        required: true
+        default: ''
+
+jobs:
+  terraform_destroy:
+    runs-on: ubuntu-latest
+    if: ${{ github.event.inputs.confirm == 'destroy' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.6.0
+          terraform_wrapper: false
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Terraform init
+        working-directory: terraform
+        run: terraform init
+
+      - name: Show what will be destroyed
+        working-directory: terraform
+        run: |
+          echo "The following resources will be DESTROYED:"
+          terraform plan -destroy \
+            -var="local_installer_path=dummy_path" \
+            -var="admin_password=${{ secrets.ADMIN_PASSWORD }}"
+
+      - name: Terraform destroy
+        working-directory: terraform
+        run: |
+          terraform destroy -auto-approve \
+            -var="local_installer_path=dummy_path" \
+            -var="admin_password=${{ secrets.ADMIN_PASSWORD }}"
+
+      - name: Cleanup verification
+        run: |
+          echo "✅ All infrastructure has been destroyed"
+          echo "Please verify in AWS console that all resources are removed:"
+          echo "- EC2 instances"
+          echo "- S3 buckets" 
+          echo "- IAM roles"
+          echo "- Security groups"
