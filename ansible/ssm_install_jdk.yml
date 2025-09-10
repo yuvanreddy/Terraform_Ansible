@@ -1,0 +1,57 @@
+---
+- name: Install OpenJDK 21 on Windows via SSM RunCommand
+  hosts: localhost
+  connection: local
+  gather_facts: no
+
+  vars:
+    # These will be supplied from GitHub Actions env or computed from terraform outputs
+    presigned_url: "{{ lookup('env','PRESIGNED_URL') }}"
+    installer_local: "C:\\Temp\\OpenJDK21U-jdk_x64_windows_hotspot_21.0.8_9.exe"
+    instance_ids: "{{ lookup('env','INSTANCE_IDS') | default('') | from_json }}" 
+    # INSTANCE_IDS should be a JSON array string like '["i-0123","i-0456"]'
+    ssm_document: "AWS-RunPowerShellScript"
+    ssm_timeout_seconds: 3600
+
+  tasks:
+    - name: Validate inputs
+      fail:
+        msg: "presigned_url or instance_ids not provided"
+      when: presigned_url == "" or instance_ids == ""
+
+    - name: Build PowerShell script to download & run JDK installer
+      set_fact:
+        ps_script: |
+          $ErrorActionPreference = "Stop"
+          if (!(Test-Path -Path 'C:\Temp')) { New-Item -Path 'C:\Temp' -ItemType Directory | Out-Null }
+          $url = "{{ presigned_url }}"
+          $out = "{{ installer_local }}"
+          Write-Output "Downloading JDK installer from $url to $out"
+          Invoke-WebRequest -Uri $url -OutFile $out -UseBasicParsing
+          Write-Output "Downloaded. Running installer..."
+          Start-Process -FilePath $out -ArgumentList '/s' -Wait
+          Write-Output "Installer finished. Verifying java -version..."
+          try {
+            $ver = & java -version 2>&1
+            Write-Output $ver
+          } catch {
+            Write-Output "java not found or error: $_"
+            exit 1
+          }
+
+    - name: Call SSM RunCommand to execute the PowerShell script on instances
+      amazon.aws.aws_ssm:
+        targets:
+          - Key: InstanceIds
+            Values: "{{ instance_ids }}"
+        document_name: "{{ ssm_document }}"
+        document_parameters:
+          commands:
+            - "{{ ps_script }}"
+        timeout_seconds: "{{ ssm_timeout_seconds }}"
+        wait: true
+      register: ssm_result
+
+    - name: Show SSM result
+      debug:
+        var: ssm_result

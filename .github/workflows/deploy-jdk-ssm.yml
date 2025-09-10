@@ -1,0 +1,107 @@
+name: deploy-jdk-ssm
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+jobs:
+  terraform_apply:
+    runs-on: ubuntu-latest
+    outputs:
+      instance_ids: ${{ steps.outputs_json.outputs_instance_ids }}
+      bucket: ${{ steps.outputs_json.outputs_bucket }}
+      s3_key: ${{ steps.outputs_json.outputs_key }}
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v2
+      with:
+        terraform_version: 1.6.0
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v2
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ secrets.AWS_REGION }}
+
+    - name: Terraform init
+      working-directory: terraform
+      run: terraform init
+
+    - name: Terraform apply
+      working-directory: terraform
+      run: terraform apply -auto-approve -var="local_installer_path=${{ github.workspace }}/files/OpenJDK21U-jdk_x64_windows_hotspot_21.0.8_9.exe"
+      # If you do not want Terraform to upload the object (large file), set local_installer_path to "" and upload via aws cli below.
+
+    - name: Read terraform outputs (json)
+      working-directory: terraform
+      id: outputs_json
+      run: |
+        terraform output -json > tfout.json
+        python3 - <<'PY'
+import json,sys
+o=json.load(open('tfout.json'))
+out = {}
+out['outputs_instance_ids'] = json.dumps(o['instance_ids']['value'])
+out['outputs_bucket'] = o['s3_bucket']['value']
+# s3_key may not exist if Terraform didn't upload it
+out['outputs_key'] = o.get('s3_key', {}).get('value', 'installers/OpenJDK21U-jdk_x64_windows_hotspot_21.0.8_9.exe')
+print("::set-output name=outputs_instance_ids::" + out['outputs_instance_ids'])
+print("::set-output name=outputs_bucket::" + out['outputs_bucket'])
+print("::set-output name=outputs_key::" + out['outputs_key'])
+PY
+
+  generate_presigned_and_run_ansible:
+    needs: terraform_apply
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v2
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ secrets.AWS_REGION }}
+
+    - name: Prepare variables
+      id: prep
+      run: |
+        echo "INSTANCE_IDS=${{ needs.terraform_apply.outputs.instance_ids }}" >> $GITHUB_ENV
+        echo "BUCKET=${{ needs.terraform_apply.outputs.bucket }}" >> $GITHUB_ENV
+        echo "KEY=${{ needs.terraform_apply.outputs.s3_key }}" >> $GITHUB_ENV
+        echo "EXPIRY=300" >> $GITHUB_ENV   # presigned URL expiry seconds
+
+    - name: Generate presigned URL (AWS CLI)
+      id: presign
+      run: |
+        # The aws cli doesn't directly create presigned URL for S3 using 'aws s3 presign' on older cli versions.
+        # Use `aws s3 presign s3://bucket/key --expires-in seconds`
+        aws s3 presign "s3://$BUCKET/$KEY" --expires-in $EXPIRY > presigned.txt
+        PRESIGNED_URL=$(cat presigned.txt)
+        echo "PRESIGNED_URL=$PRESIGNED_URL" >> $GITHUB_ENV
+        echo "Presigned URL created (expires in $EXPIRY seconds)"
+
+    - name: Show instance ids (sanitized)
+      run: |
+        echo "INSTANCE_IDS: $INSTANCE_IDS"
+
+    - name: Install Python deps (Ansible + AWS collections)
+      run: |
+        python -m pip install --upgrade pip
+        pip install ansible boto3 botocore amazon.aws
+
+    - name: Run Ansible playbook to call SSM
+      env:
+        PRESIGNED_URL: ${{ env.PRESIGNED_URL }}
+        INSTANCE_IDS: ${{ needs.terraform_apply.outputs.instance_ids }}
+        AWS_REGION: ${{ secrets.AWS_REGION }}
+        AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      run: |
+        ansible-playbook ansible/ssm_install_jdk.yml -e "presigned_url=${{ env.PRESIGNED_URL }}" 
