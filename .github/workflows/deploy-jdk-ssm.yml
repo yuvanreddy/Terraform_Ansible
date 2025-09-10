@@ -16,6 +16,25 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Create files directory
+        run: mkdir -p files
+
+      - name: Download OpenJDK installer
+        run: |
+          JDK_URL="https://github.com/adoptium/temurin21-binaries/releases/download/jdk-21.0.5%2B11/OpenJDK21U-jdk_x64_windows_hotspot_21.0.5_11.msi"
+          JDK_FILE="files/OpenJDK21U-jdk_x64_windows_hotspot_21.0.8_9.exe"
+          
+          # Download the latest available version (adjust URL as needed)
+          curl -L -o "$JDK_FILE" "$JDK_URL"
+          
+          # Verify file was downloaded
+          if [ ! -f "$JDK_FILE" ]; then
+            echo "Error: Failed to download JDK installer"
+            exit 1
+          fi
+          
+          echo "Downloaded JDK installer: $(ls -lh $JDK_FILE)"
+
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
         with:
