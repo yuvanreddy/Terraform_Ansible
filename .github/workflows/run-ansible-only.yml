@@ -1,0 +1,269 @@
+name: Run Ansible Deployment Only
+
+on:
+  workflow_dispatch:
+    inputs:
+      instance_ids:
+        description: 'Instance IDs (JSON array format: ["i-xxx","i-yyy"])'
+        required: false
+        type: string
+      s3_bucket:
+        description: 'S3 bucket name (leave empty to fetch from Terraform)'
+        required: false
+        type: string
+      s3_key:
+        description: 'S3 key path (leave empty to fetch from Terraform)'
+        required: false
+        type: string
+
+jobs:
+  get_terraform_outputs:
+    runs-on: ubuntu-latest
+    outputs:
+      instance_ids: ${{ steps.get_outputs.outputs.instance_ids }}
+      bucket: ${{ steps.get_outputs.outputs.bucket }}
+      s3_key: ${{ steps.get_outputs.outputs.s3_key }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.6.0
+          terraform_wrapper: false
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Initialize Terraform backend
+        working-directory: terraform
+        run: |
+          BACKEND_BUCKET="terraform-state-jdk-deployment-${{ github.repository_owner }}"
+          cat > backend.tf << EOF
+          terraform {
+            backend "s3" {
+              bucket         = "$BACKEND_BUCKET"
+              key            = "jdk-deployment/terraform.tfstate"
+              region         = "${{ secrets.AWS_REGION }}"
+              encrypt        = true
+              dynamodb_table = "terraform-state-lock-jdk"
+            }
+          }
+          EOF
+          
+          terraform init -reconfigure
+
+      - name: Get Terraform outputs
+        id: get_outputs
+        working-directory: terraform
+        run: |
+          # Use provided values or fetch from Terraform state
+          if [ -n "${{ github.event.inputs.instance_ids }}" ]; then
+            INSTANCE_IDS="${{ github.event.inputs.instance_ids }}"
+          else
+            INSTANCE_IDS=$(terraform output -raw instance_ids 2>/dev/null || echo "[]")
+          fi
+          
+          if [ -n "${{ github.event.inputs.s3_bucket }}" ]; then
+            BUCKET="${{ github.event.inputs.s3_bucket }}"
+          else
+            BUCKET=$(terraform output -raw s3_bucket 2>/dev/null || echo "")
+          fi
+          
+          if [ -n "${{ github.event.inputs.s3_key }}" ]; then
+            S3_KEY="${{ github.event.inputs.s3_key }}"
+          else
+            S3_KEY=$(terraform output -raw s3_key 2>/dev/null || echo "")
+          fi
+          
+          echo "instance_ids=$INSTANCE_IDS" >> $GITHUB_OUTPUT
+          echo "bucket=$BUCKET" >> $GITHUB_OUTPUT
+          echo "s3_key=$S3_KEY" >> $GITHUB_OUTPUT
+          
+          echo "Instance IDs: $INSTANCE_IDS"
+          echo "Bucket: $BUCKET"
+          echo "S3 Key: $S3_KEY"
+
+  run_ansible:
+    needs: get_terraform_outputs
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Setup Python and install dependencies
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Ansible and AWS dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install ansible boto3 botocore
+          ansible-galaxy collection install amazon.aws
+
+      - name: Wait for instances to be ready
+        env:
+          INST_RAW: ${{ needs.get_terraform_outputs.outputs.instance_ids }}
+        run: |
+          echo "Waiting for instances to be ready for SSM..."
+          if echo "$INST_RAW" | jq -e . >/dev/null 2>&1; then
+            INSTANCE_IDS=$(echo "$INST_RAW" | jq -r '.[]' | tr '\n' ' ')
+            
+            for instance_id in $INSTANCE_IDS; do
+              echo "Checking instance $instance_id..."
+              
+              # Check if instance exists and is running
+              if ! aws ec2 describe-instances --instance-ids "$instance_id" --query 'Reservations[0].Instances[0].State.Name' --output text 2>/dev/null | grep -q "running"; then
+                echo "Warning: Instance $instance_id is not in running state"
+                continue
+              fi
+              
+              # Wait for SSM agent
+              timeout=300
+              while [ $timeout -gt 0 ]; do
+                if aws ssm describe-instance-information --filters "Key=InstanceIds,Values=$instance_id" --query 'InstanceInformationList[0].PingStatus' --output text 2>/dev/null | grep -q "Online"; then
+                  echo "Instance $instance_id is ready for SSM"
+                  break
+                fi
+                echo "Waiting for SSM agent on $instance_id... ($timeout seconds remaining)"
+                sleep 10
+                timeout=$((timeout - 10))
+              done
+              
+              if [ $timeout -eq 0 ]; then
+                echo "Warning: Timeout waiting for SSM agent on $instance_id"
+              fi
+            done
+          else
+            echo "No valid instance IDs found"
+            exit 1
+          fi
+
+      - name: Validate S3 object exists
+        env:
+          BUCKET: ${{ needs.get_terraform_outputs.outputs.bucket }}
+          KEY: ${{ needs.get_terraform_outputs.outputs.s3_key }}
+        run: |
+          if [ -n "$BUCKET" ] && [ -n "$KEY" ]; then
+            if aws s3api head-object --bucket "$BUCKET" --key "$KEY" >/dev/null 2>&1; then
+              echo "✅ S3 object validated: s3://$BUCKET/$KEY"
+              
+              # Get object size
+              SIZE=$(aws s3api head-object --bucket "$BUCKET" --key "$KEY" --query 'ContentLength' --output text)
+              echo "Object size: $((SIZE / 1024 / 1024)) MB"
+            else
+              echo "❌ Error: S3 object s3://$BUCKET/$KEY does not exist"
+              echo "Please upload the JDK installer to S3 first"
+              exit 1
+            fi
+          else
+            echo "❌ Error: S3 bucket or key not specified"
+            exit 1
+          fi
+
+      - name: Generate presigned URL
+        env:
+          BUCKET: ${{ needs.get_terraform_outputs.outputs.bucket }}
+          KEY: ${{ needs.get_terraform_outputs.outputs.s3_key }}
+          EXPIRY: 1800
+        run: |
+          if [ -n "$BUCKET" ] && [ -n "$KEY" ]; then
+            PRESIGNED_URL=$(aws s3 presign "s3://$BUCKET/$KEY" --expires-in $EXPIRY)
+            echo "PRESIGNED_URL=$PRESIGNED_URL" >> $GITHUB_ENV
+            echo "✅ Presigned URL generated successfully (expires in 30 minutes)"
+          else
+            echo "❌ Cannot generate presigned URL - bucket or key missing"
+            exit 1
+          fi
+
+      - name: Normalize instance IDs
+        env:
+          INST_RAW: ${{ needs.get_terraform_outputs.outputs.instance_ids }}
+        run: |
+          echo "$INST_RAW" > inst_raw.txt
+          if echo "$INST_RAW" | jq -e . >/dev/null 2>&1; then
+            echo "$INST_RAW" | jq -c '.' > inst_list.json
+          else
+            echo '[]' > inst_list.json
+          fi
+          INST_JSON=$(cat inst_list.json)
+          echo "INST_JSON=$INST_JSON" >> $GITHUB_ENV
+          echo "📋 Instance IDs to process: $INST_JSON"
+
+      - name: Run Ansible playbook via SSM
+        env:
+          PRESIGNED_URL: ${{ env.PRESIGNED_URL }}
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+          INST_JSON: ${{ env.INST_JSON }}
+          BUCKET: ${{ needs.get_terraform_outputs.outputs.bucket }}
+          S3_KEY: ${{ needs.get_terraform_outputs.outputs.s3_key }}
+        run: |
+          if [ ! -f "ansible/ssm_install_jdk.yml" ]; then
+            echo "❌ Error: Ansible playbook not found at ansible/ssm_install_jdk.yml"
+            exit 1
+          fi
+          
+          echo "🚀 Running Ansible playbook on instances: $INST_JSON"
+          
+          ansible-playbook ansible/ssm_install_jdk.yml \
+            -e "instance_ids=$INST_JSON" \
+            -e "s3_bucket=$BUCKET" \
+            -e "s3_key=$S3_KEY" \
+            -e "presigned_url=$PRESIGNED_URL" \
+            -e "aws_region=$AWS_REGION" \
+            -v
+
+      - name: Verify installation
+        env:
+          INST_JSON: ${{ env.INST_JSON }}
+        run: |
+          echo "🔍 Verifying JDK installation on instances..."
+          
+          if echo "$INST_JSON" | jq -e . >/dev/null 2>&1; then
+            INSTANCE_IDS=$(echo "$INST_JSON" | jq -r '.[]')
+            
+            for instance_id in $INSTANCE_IDS; do
+              echo "Checking JDK on instance $instance_id..."
+              
+              # Send command to check JDK installation
+              COMMAND_ID=$(aws ssm send-command \
+                --instance-ids "$instance_id" \
+                --document-name "AWS-RunPowerShellScript" \
+                --parameters 'commands=["java -version 2>&1"]' \
+                --query 'Command.CommandId' \
+                --output text)
+              
+              # Wait for command to complete
+              sleep 5
+              
+              # Get command output
+              OUTPUT=$(aws ssm get-command-invocation \
+                --command-id "$COMMAND_ID" \
+                --instance-id "$instance_id" \
+                --query 'StandardOutputContent' \
+                --output text 2>/dev/null || echo "Unable to verify")
+              
+              echo "Instance $instance_id JDK status: $OUTPUT"
+            done
+          fi
+          
+          echo "✅ Ansible deployment completed!"
+
+      - name: Cleanup
+        if: always()
+        run: |
+          rm -f inst_list.json inst_raw.txt
+          echo "🧹 Cleanup completed"
