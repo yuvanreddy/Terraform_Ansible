@@ -12,14 +12,8 @@ terraform {
     }
   }
   
-  # Use S3 backend for state management (prevents resource recreation)
-  backend "s3" {
-    bucket         = "terraform-state-jdk-deployment"  # Change this to your unique bucket name
-    key            = "jdk-deployment/terraform.tfstate"
-    region         = "us-east-1"  # Change to your preferred region
-    encrypt        = true
-    dynamodb_table = "terraform-state-lock"
-  }
+  # Backend configuration will be created dynamically by the workflow
+  # Do not add backend "s3" block here to avoid duplicate configuration
 }
 
 # Configure AWS Provider
