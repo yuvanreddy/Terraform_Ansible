@@ -1,188 +1,202 @@
 ---
-- name: Install JDK via SSM on Windows instances
+- name: Install JDK on Windows instances via SSM
   hosts: localhost
-  gather_facts: false
+  gather_facts: no
   vars:
-    aws_region: "{{ aws_region }}"
-    instance_ids: "{{ instance_ids | from_json }}"
-    s3_bucket: "{{ s3_bucket }}"
-    s3_key: "{{ s3_key }}"
-    presigned_url: "{{ presigned_url }}"
+    ansible_python_interpreter: "{{ ansible_playbook_python }}"
     
   tasks:
-    - name: Display installation parameters
+    - name: Debug input variables
       debug:
         msg:
-          - "Installing JDK on instances: {{ instance_ids }}"
-          - "S3 location: s3://{{ s3_bucket }}/{{ s3_key }}"
+          - "Instance IDs: {{ instance_ids }}"
+          - "S3 Bucket: {{ s3_bucket | default('Not provided') }}"
+          - "S3 Key: {{ s3_key | default('Not provided') }}"
           - "AWS Region: {{ aws_region }}"
+          - "Presigned URL Available: {{ 'Yes' if presigned_url is defined and presigned_url else 'No' }}"
 
-    - name: Install JDK via SSM
-      amazon.aws.aws_ssm_send_command:
+    - name: Parse instance IDs
+      set_fact:
+        target_instances: "{{ instance_ids | from_json if instance_ids is string else instance_ids }}"
+
+    - name: Validate instance IDs
+      fail:
+        msg: "No valid instance IDs provided"
+      when: target_instances | length == 0
+
+    - name: Check if instances are running and SSM-enabled
+      amazon.aws.aws_ssm_info:
+        filters:
+          - key: InstanceIds
+            values: "{{ target_instances }}"
         region: "{{ aws_region }}"
-        instance_ids: "{{ instance_ids }}"
-        document_name: "AWS-RunPowerShellScript"
-        parameters:
-          commands:
-            - |
-              Write-Host "=== JDK Installation Started ==="
-              Write-Host "Timestamp: $(Get-Date)"
-              
-              # Set variables
-              $downloadUrl = "{{ presigned_url }}"
-              $installerPath = "C:\temp\jdk_installer.msi"
-              $logPath = "C:\temp\jdk_install.log"
-              
-              # Create temp directory
-              if (-not (Test-Path "C:\temp")) {
-                  New-Item -ItemType Directory -Path "C:\temp" -Force
-              }
-              
-              try {
-                  # Download JDK installer
-                  Write-Host "📥 Downloading JDK installer..."
-                  Write-Host "Download URL: $downloadUrl"
+      register: ssm_instances
+
+    - name: Display SSM-enabled instances
+      debug:
+        msg: "SSM-enabled instances: {{ ssm_instances.instance_information | map(attribute='InstanceId') | list }}"
+
+    - name: Wait for all instances to be SSM-ready
+      amazon.aws.aws_ssm_info:
+        filters:
+          - key: InstanceIds
+            values: "{{ target_instances }}"
+        region: "{{ aws_region }}"
+      register: ssm_check
+      until: ssm_check.instance_information | length == target_instances | length
+      retries: 30
+      delay: 10
+      failed_when: false
+
+    - name: Create PowerShell script for JDK installation
+      set_fact:
+        jdk_install_script: |
+          # JDK Installation Script for Windows
+          param(
+              [string]$PresignedUrl,
+              [string]$S3Bucket,
+              [string]$S3Key
+          )
+          
+          Write-Output "Starting JDK installation process..."
+          Write-Output "Timestamp: $(Get-Date)"
+          
+          # Define installation parameters
+          $TempDir = "C:\Temp"
+          $JavaDir = "C:\Program Files\Java"
+          $LogFile = "$TempDir\jdk-install-log.txt"
+          
+          # Create directories
+          if (!(Test-Path $TempDir)) {
+              New-Item -ItemType Directory -Path $TempDir -Force
+          }
+          if (!(Test-Path $JavaDir)) {
+              New-Item -ItemType Directory -Path $JavaDir -Force
+          }
+          
+          # Function to write log
+          function Write-Log {
+              param([string]$Message)
+              $Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+              $LogMessage = "[$Timestamp] $Message"
+              Write-Output $LogMessage
+              Add-Content -Path $LogFile -Value $LogMessage
+          }
+          
+          Write-Log "JDK installation started"
+          
+          try {
+              # Download JDK installer
+              if ($PresignedUrl -and $PresignedUrl -ne "") {
+                  Write-Log "Downloading JDK from presigned URL..."
+                  $InstallerPath = "$TempDir\jdk-installer.msi"
                   
-                  # Use TLS 1.2 for secure downloads
-                  [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+                  # Download with retry logic
+                  $MaxRetries = 3
+                  $RetryCount = 0
+                  $Downloaded = $false
                   
-                  Invoke-WebRequest -Uri $downloadUrl -OutFile $installerPath -UseBasicParsing
-                  
-                  if (-not (Test-Path $installerPath)) {
-                      throw "Downloaded installer not found at $installerPath"
+                  while ($RetryCount -lt $MaxRetries -and -not $Downloaded) {
+                      try {
+                          Invoke-WebRequest -Uri $PresignedUrl -OutFile $InstallerPath -UseBasicParsing -TimeoutSec 300
+                          if (Test-Path $InstallerPath) {
+                              $FileSize = (Get-Item $InstallerPath).Length
+                              Write-Log "Download completed. File size: $($FileSize / 1MB) MB"
+                              $Downloaded = $true
+                          }
+                      }
+                      catch {
+                          $RetryCount++
+                          Write-Log "Download attempt $RetryCount failed: $($_.Exception.Message)"
+                          if ($RetryCount -lt $MaxRetries) {
+                              Start-Sleep -Seconds 30
+                          }
+                      }
                   }
                   
-                  $fileInfo = Get-Item $installerPath
-                  Write-Host "✅ Download completed: $($fileInfo.Name) ($($fileInfo.Length) bytes)"
+                  if (-not $Downloaded) {
+                      throw "Failed to download JDK installer after $MaxRetries attempts"
+                  }
+              }
+              elseif ($S3Bucket -and $S3Key) {
+                  Write-Log "Downloading JDK from S3 using AWS CLI..."
+                  $InstallerPath = "$TempDir\jdk-installer.msi"
                   
-                  # Install JDK silently
-                  Write-Host "🔧 Installing JDK..."
-                  $installArgs = @(
-                      "/i", $installerPath,
-                      "/quiet",
-                      "/norestart",
-                      "/log", $logPath,
-                      "ADDLOCAL=FeatureMain,FeatureEnvironment,FeatureJarFileRunWith,FeatureJavaHome",
-                      "INSTALLDIR=C:\Program Files\Eclipse Adoptium\jdk-21.0.5.11-hotspot\"
+                  # Use AWS CLI to download
+                  $AwsCommand = "aws s3 cp s3://$S3Bucket/$S3Key $InstallerPath"
+                  $Result = cmd /c $AwsCommand 2>&1
+                  
+                  if ($LASTEXITCODE -eq 0 -and (Test-Path $InstallerPath)) {
+                      Write-Log "S3 download completed successfully"
+                  } else {
+                      throw "Failed to download from S3: $Result"
+                  }
+              }
+              else {
+                  # Try to find existing installer
+                  $PossiblePaths = @(
+                      "$TempDir\*.msi",
+                      "C:\Downloads\*.msi",
+                      "D:\installers\*.msi"
                   )
                   
-                  Write-Host "Installation command: msiexec.exe $($installArgs -join ' ')"
-                  $process = Start-Process -FilePath "msiexec.exe" -ArgumentList $installArgs -Wait -PassThru
-                  
-                  Write-Host "Installation process exit code: $($process.ExitCode)"
-                  
-                  # Check common MSI exit codes
-                  switch ($process.ExitCode) {
-                      0 { Write-Host "✅ JDK installation completed successfully" }
-                      1602 { throw "Installation canceled by user" }
-                      1603 { throw "Fatal error during installation" }
-                      1618 { throw "Another installation is in progress" }
-                      1619 { throw "Installation package could not be opened" }
-                      1633 { throw "Installation package is not supported on this platform" }
-                      default { throw "Installation failed with exit code: $($process.ExitCode)" }
-                  }
-                  
-                  # Wait a moment for installation to complete
-                  Start-Sleep -Seconds 10
-                  
-                  # Verify installation
-                  Write-Host "🔍 Verifying installation..."
-                  
-                  # Refresh environment variables
-                  $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
-                  
-                  # Check if Java is in PATH
-                  try {
-                      $javaVersion = & java -version 2>&1
-                      if ($LASTEXITCODE -eq 0) {
-                          Write-Host "✅ Java command is accessible"
-                          $javaVersion | ForEach-Object { Write-Host "  $_" }
-                      } else {
-                          Write-Host "⚠️ Java command returned exit code: $LASTEXITCODE"
+                  $InstallerPath = $null
+                  foreach ($Path in $PossiblePaths) {
+                      $Files = Get-ChildItem -Path $Path -ErrorAction SilentlyContinue | Where-Object { $_.Name -like "*jdk*" -or $_.Name -like "*java*" }
+                      if ($Files) {
+                          $InstallerPath = $Files[0].FullName
+                          Write-Log "Found existing installer: $InstallerPath"
+                          break
                       }
-                  } catch {
-                      Write-Host "⚠️ Java command not immediately available (may need system restart)"
                   }
                   
-                  # Check JAVA_HOME
-                  $javaHome = [System.Environment]::GetEnvironmentVariable("JAVA_HOME", "Machine")
-                  if ($javaHome) {
-                      Write-Host "✅ JAVA_HOME set to: $javaHome"
-                  } else {
-                      Write-Host "⚠️ JAVA_HOME not set (may need system restart)"
-                  }
-                  
-                  # Check installation directory
-                  $installDir = "C:\Program Files\Eclipse Adoptium"
-                  if (Test-Path $installDir) {
-                      Write-Host "✅ JDK files found in: $installDir"
-                      $jdkDirs = Get-ChildItem $installDir -Directory
-                      foreach ($dir in $jdkDirs) {
-                          Write-Host "  Found JDK: $($dir.Name)"
-                      }
-                  } else {
-                      Write-Host "⚠️ JDK installation directory not found"
-                  }
-                  
-                  Write-Host "=== Installation Complete ==="
-                  
-              } catch {
-                  Write-Host "❌ Installation failed: $($_.Exception.Message)"
-                  
-                  # Show installation log if available
-                  if (Test-Path $logPath) {
-                      Write-Host "📋 Installation log contents:"
-                      Get-Content $logPath | Select-Object -Last 50 | ForEach-Object { Write-Host "  $_" }
-                  }
-                  
-                  # Show system info for debugging
-                  Write-Host "🔍 System Information:"
-                  Write-Host "  OS: $(Get-WmiObject -Class Win32_OperatingSystem | Select-Object -ExpandProperty Caption)"
-                  Write-Host "  Architecture: $env:PROCESSOR_ARCHITECTURE"
-                  Write-Host "  PowerShell Version: $($PSVersionTable.PSVersion)"
-                  
-                  throw
-              } finally {
-                  # Cleanup installer file
-                  if (Test-Path $installerPath) {
-                      Remove-Item $installerPath -Force
-                      Write-Host "🧹 Cleaned up installer file"
+                  if (-not $InstallerPath) {
+                      throw "No JDK installer found and no download source provided"
                   }
               }
-        wait_for_results: true
-        max_wait_time: 600
-      register: install_result
-
-    - name: Display installation results
-      debug:
-        msg: |
-          Instance: {{ item.instance_id }}
-          Status: {{ item.status }}
-          Command ID: {{ item.command_id }}
-          {% if item.status == 'Success' %}
-          ✅ Installation Output:
-          {{ item.stdout | default('No output') }}
-          {% elif item.status == 'Failed' %}
-          ❌ Installation Failed:
-          {{ item.stderr | default('No error details') }}
-          {% else %}
-          ℹ️ Status: {{ item.status }}
-          Output: {{ item.stdout | default('No output') }}
-          {% endif %}
-      loop: "{{ install_result.invocations }}"
-
-    - name: Check for installation failures
-      fail:
-        msg: "JDK installation failed on one or more instances. Check the output above for details."
-      when: install_result.invocations | selectattr('status', 'equalto', 'Failed') | list | length > 0
-
-    - name: Installation summary
-      debug:
-        msg: |
-          🎉 JDK Installation Summary:
-          Total instances: {{ install_result.invocations | length }}
-          Successful: {{ install_result.invocations | selectattr('status', 'equalto', 'Success') | list | length }}
-          Failed: {{ install_result.invocations | selectattr('status', 'equalto', 'Failed') | list | length }}
-          
-          ℹ️ Note: Environment variables may require a system restart to take full effect.
-          Use the verification job to confirm the installation status.
+              
+              # Verify installer file
+              if (!(Test-Path $InstallerPath)) {
+                  throw "Installer file not found: $InstallerPath"
+              }
+              
+              $InstallerSize = (Get-Item $InstallerPath).Length
+              Write-Log "Installer ready: $InstallerPath (Size: $($InstallerSize / 1MB) MB)"
+              
+              # Check if JDK is already installed
+              $ExistingJava = Get-Command java -ErrorAction SilentlyContinue
+              if ($ExistingJava) {
+                  $JavaVersion = & java -version 2>&1 | Select-Object -First 1
+                  Write-Log "Existing Java found: $JavaVersion"
+                  
+                  # Check if it's the target version (OpenJDK 21)
+                  if ($JavaVersion -match "21\.") {
+                      Write-Log "OpenJDK 21 is already installed. Skipping installation."
+                      return
+                  }
+              }
+              
+              # Install JDK silently
+              Write-Log "Starting JDK installation..."
+              
+              # Determine installer type and install accordingly
+              $InstallerExt = [System.IO.Path]::GetExtension($InstallerPath).ToLower()
+              
+              if ($InstallerExt -eq ".msi") {
+                  # MSI installation
+                  $InstallArgs = @(
+                      "/i", "`"$InstallerPath`"",
+                      "/quiet",
+                      "/norestart",
+                      "INSTALLDIR=`"C:\Program Files\Java\jdk-21`"",
+                      "ADDLOCAL=FeatureMain,FeatureEnvironment,FeatureJarFileRunWith,FeatureJavaHome"
+                  )
+                  
+                  Write-Log "Running MSI installer with arguments: $($InstallArgs -join ' ')"
+                  $Process = Start-Process -FilePath "msiexec.exe" -ArgumentList $InstallArgs -Wait -PassThru -NoNewWindow
+                  
+              } elseif ($InstallerExt -eq ".exe") {
+                  # EXE installation
+                  $InstallArgs = @(
+                      "/s",
+                      "INSTALLDIR=C:\

@@ -1,0 +1,400 @@
+name: destroy-jdk-resources
+
+on:
+  workflow_dispatch:
+    inputs:
+      destroy_scope:
+        description: 'What to destroy'
+        required: true
+        type: choice
+        options:
+          - 'instances-only'
+          - 'all-except-s3'
+          - 'everything'
+          - 's3-only'
+      confirm_destroy:
+        description: 'Type "DESTROY" to confirm'
+        required: true
+        type: string
+      environment:
+        description: 'Environment to destroy'
+        required: true
+        type: choice
+        options:
+          - 'dev'
+          - 'staging'
+          - 'prod'
+      backup_data:
+        description: 'Backup data before destroy'
+        required: false
+        default: true
+        type: boolean
+
+env:
+  TF_VAR_environment: ${{ github.event.inputs.environment }}
+
+jobs:
+  validate_inputs:
+    runs-on: ubuntu-latest
+    outputs:
+      proceed: ${{ steps.validate.outputs.proceed }}
+    steps:
+      - name: Validate destroy confirmation
+        id: validate
+        run: |
+          if [ "${{ github.event.inputs.confirm_destroy }}" != "DESTROY" ]; then
+            echo "❌ Destroy confirmation failed. You must type 'DESTROY' exactly."
+            echo "proceed=false" >> $GITHUB_OUTPUT
+            exit 1
+          else
+            echo "✅ Destroy confirmation validated"
+            echo "proceed=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Validate environment
+        run: |
+          if [ "${{ github.event.inputs.environment }}" == "prod" ]; then
+            echo "⚠️  WARNING: You are about to destroy PRODUCTION resources!"
+            echo "Please ensure you have proper authorization and backups."
+          fi
+
+  backup_data:
+    runs-on: ubuntu-latest
+    needs: validate_inputs
+    if: ${{ needs.validate_inputs.outputs.proceed == 'true' && github.event.inputs.backup_data == 'true' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.6.0
+          terraform_wrapper: false
+
+      - name: Initialize Terraform for backup
+        working-directory: terraform
+        run: |
+          BACKEND_BUCKET="terraform-state-jdk-deployment-${{ github.repository_owner }}"
+          cat > backend.tf << EOF
+          terraform {
+            backend "s3" {
+              bucket         = "$BACKEND_BUCKET"
+              key            = "jdk-deployment/terraform.tfstate"
+              region         = "${{ secrets.AWS_REGION }}"
+              encrypt        = true
+              dynamodb_table = "terraform-state-lock-jdk"
+            }
+          }
+          EOF
+          terraform init
+
+      - name: Export current state and resources
+        working-directory: terraform
+        run: |
+          echo "📋 Creating backup of current infrastructure..."
+          
+          # Create backup directory
+          mkdir -p ../backups/$(date +%Y%m%d_%H%M%S)
+          BACKUP_DIR="../backups/$(date +%Y%m%d_%H%M%S)"
+          
+          # Export Terraform state
+          terraform show -json > "$BACKUP_DIR/terraform-state.json"
+          terraform output -json > "$BACKUP_DIR/terraform-outputs.json"
+          
+          # List all resources
+          terraform state list > "$BACKUP_DIR/resource-list.txt"
+          
+          # Get resource details
+          terraform show > "$BACKUP_DIR/terraform-plan-readable.txt"
+          
+          # Export AWS resource details
+          echo "📊 Exporting AWS resource details..."
+          
+          # Get instance details
+          if terraform output -raw instance_ids 2>/dev/null | jq -e . >/dev/null 2>&1; then
+            INSTANCE_IDS=$(terraform output -raw instance_ids | jq -r '.[]' | tr '\n' ' ')
+            if [ -n "$INSTANCE_IDS" ]; then
+              aws ec2 describe-instances --instance-ids $INSTANCE_IDS > "$BACKUP_DIR/ec2-instances.json"
+            fi
+          fi
+          
+          # Get S3 bucket details
+          if terraform output -raw s3_bucket 2>/dev/null; then
+            BUCKET=$(terraform output -raw s3_bucket)
+            if [ -n "$BUCKET" ]; then
+              aws s3api list-objects-v2 --bucket "$BUCKET" > "$BACKUP_DIR/s3-objects.json" || true
+              aws s3api get-bucket-location --bucket "$BUCKET" > "$BACKUP_DIR/s3-location.json" || true
+            fi
+          fi
+          
+          # Get VPC details
+          if terraform output -raw vpc_id 2>/dev/null; then
+            VPC_ID=$(terraform output -raw vpc_id)
+            if [ -n "$VPC_ID" ]; then
+              aws ec2 describe-vpcs --vpc-ids "$VPC_ID" > "$BACKUP_DIR/vpc-details.json" || true
+              aws ec2 describe-subnets --filters "Name=vpc-id,Values=$VPC_ID" > "$BACKUP_DIR/subnet-details.json" || true
+            fi
+          fi
+          
+          echo "✅ Backup completed in: $BACKUP_DIR"
+          ls -la "$BACKUP_DIR"
+
+      - name: Upload backup to S3
+        run: |
+          BACKUP_BUCKET="terraform-backups-${{ github.repository_owner }}-${{ secrets.AWS_REGION }}"
+          
+          # Create backup bucket if it doesn't exist
+          if ! aws s3api head-bucket --bucket "$BACKUP_BUCKET" 2>/dev/null; then
+            echo "Creating backup bucket: $BACKUP_BUCKET"
+            aws s3 mb "s3://$BACKUP_BUCKET" --region ${{ secrets.AWS_REGION }}
+            aws s3api put-bucket-versioning --bucket "$BACKUP_BUCKET" --versioning-configuration Status=Enabled
+          fi
+          
+          # Upload backups
+          aws s3 sync backups/ "s3://$BACKUP_BUCKET/jdk-deployment-backups/" --delete
+          echo "✅ Backup uploaded to s3://$BACKUP_BUCKET/jdk-deployment-backups/"
+
+  destroy_resources:
+    runs-on: ubuntu-latest
+    needs: [validate_inputs, backup_data]
+    if: ${{ always() && needs.validate_inputs.outputs.proceed == 'true' && !failure() }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.6.0
+          terraform_wrapper: false
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Initialize Terraform for destroy
+        working-directory: terraform
+        run: |
+          BACKEND_BUCKET="terraform-state-jdk-deployment-${{ github.repository_owner }}"
+          cat > backend.tf << EOF
+          terraform {
+            backend "s3" {
+              bucket         = "$BACKEND_BUCKET"
+              key            = "jdk-deployment/terraform.tfstate"
+              region         = "${{ secrets.AWS_REGION }}"
+              encrypt        = true
+              dynamodb_table = "terraform-state-lock-jdk"
+            }
+          }
+          EOF
+          terraform init
+
+      - name: Selective destroy - Instances only
+        if: ${{ github.event.inputs.destroy_scope == 'instances-only' }}
+        working-directory: terraform
+        run: |
+          echo "🔥 Destroying EC2 instances only..."
+          terraform destroy -auto-approve \
+            -target="aws_instance.windows_servers" \
+            -target="aws_iam_instance_profile.ec2_profile" \
+            -target="aws_iam_role.ec2_ssm_role" \
+            -target="aws_iam_role_policy_attachment.ec2_ssm_policy" \
+            -var="local_installer_path=${{ github.workspace }}/files/jdk-installer.msi" \
+            -var="admin_password=${{ secrets.ADMIN_PASSWORD }}" \
+            -var="aws_region=${{ secrets.AWS_REGION }}" \
+            -var="key_pair_name=${{ secrets.KEY_PAIR_NAME }}"
+
+      - name: Selective destroy - All except S3
+        if: ${{ github.event.inputs.destroy_scope == 'all-except-s3' }}
+        working-directory: terraform
+        run: |
+          echo "🔥 Destroying all resources except S3..."
+          
+          # First, destroy instances and dependent resources
+          terraform destroy -auto-approve \
+            -target="aws_instance.windows_servers" \
+            -target="aws_iam_instance_profile.ec2_profile" \
+            -target="aws_iam_role.ec2_ssm_role" \
+            -target="aws_iam_role_policy_attachment.ec2_ssm_policy" \
+            -var="local_installer_path=${{ github.workspace }}/files/jdk-installer.msi" \
+            -var="admin_password=${{ secrets.ADMIN_PASSWORD }}" \
+            -var="aws_region=${{ secrets.AWS_REGION }}" \
+            -var="key_pair_name=${{ secrets.KEY_PAIR_NAME }}"
+          
+          # Then destroy networking
+          terraform destroy -auto-approve \
+            -target="aws_security_group.windows_sg" \
+            -target="aws_route_table_association.public" \
+            -target="aws_route_table.public" \
+            -target="aws_subnet.public" \
+            -target="aws_internet_gateway.main" \
+            -target="aws_vpc.main" \
+            -var="local_installer_path=${{ github.workspace }}/files/jdk-installer.msi" \
+            -var="admin_password=${{ secrets.ADMIN_PASSWORD }}" \
+            -var="aws_region=${{ secrets.AWS_REGION }}" \
+            -var="key_pair_name=${{ secrets.KEY_PAIR_NAME }}"
+
+      - name: Destroy everything
+        if: ${{ github.event.inputs.destroy_scope == 'everything' }}
+        working-directory: terraform
+        run: |
+          echo "💥 Destroying ALL resources..."
+          terraform destroy -auto-approve \
+            -var="local_installer_path=${{ github.workspace }}/files/jdk-installer.msi" \
+            -var="admin_password=${{ secrets.ADMIN_PASSWORD }}" \
+            -var="aws_region=${{ secrets.AWS_REGION }}" \
+            -var="key_pair_name=${{ secrets.KEY_PAIR_NAME }}"
+
+      - name: Destroy S3 only
+        if: ${{ github.event.inputs.destroy_scope == 's3-only' }}
+        working-directory: terraform
+        run: |
+          echo "🗑️ Destroying S3 resources only..."
+          
+          # First remove S3 objects
+          if terraform output -raw s3_bucket 2>/dev/null; then
+            BUCKET=$(terraform output -raw s3_bucket)
+            if [ -n "$BUCKET" ]; then
+              echo "Emptying S3 bucket: $BUCKET"
+              aws s3 rm "s3://$BUCKET" --recursive || true
+            fi
+          fi
+          
+          # Then destroy S3 resources
+          terraform destroy -auto-approve \
+            -target="aws_s3_object.jdk_installer" \
+            -target="aws_s3_bucket_public_access_block.jdk_installers_pab" \
+            -target="aws_s3_bucket_server_side_encryption_configuration.jdk_installers_encryption" \
+            -target="aws_s3_bucket_versioning.jdk_installers_versioning" \
+            -target="aws_s3_bucket.jdk_installers" \
+            -var="local_installer_path=${{ github.workspace }}/files/jdk-installer.msi" \
+            -var="admin_password=${{ secrets.ADMIN_PASSWORD }}" \
+            -var="aws_region=${{ secrets.AWS_REGION }}" \
+            -var="key_pair_name=${{ secrets.KEY_PAIR_NAME }}"
+
+  cleanup_terraform_backend:
+    runs-on: ubuntu-latest
+    needs: destroy_resources
+    if: ${{ github.event.inputs.destroy_scope == 'everything' && success() }}
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Clean up Terraform backend resources
+        run: |
+          echo "🧹 Cleaning up Terraform backend resources..."
+          
+          BACKEND_BUCKET="terraform-state-jdk-deployment-${{ github.repository_owner }}"
+          LOCK_TABLE="terraform-state-lock-jdk"
+          
+          # Remove state files
+          echo "Removing Terraform state files..."
+          aws s3 rm "s3://$BACKEND_BUCKET/jdk-deployment/" --recursive || true
+          
+          # Delete state bucket if empty
+          OBJECT_COUNT=$(aws s3api list-objects-v2 --bucket "$BACKEND_BUCKET" --query 'KeyCount' --output text 2>/dev/null || echo "0")
+          if [ "$OBJECT_COUNT" = "0" ]; then
+            echo "Deleting empty state bucket: $BACKEND_BUCKET"
+            aws s3 rb "s3://$BACKEND_BUCKET" || true
+          else
+            echo "State bucket not empty, keeping: $BACKEND_BUCKET"
+          fi
+          
+          # Delete DynamoDB lock table
+          echo "Deleting DynamoDB lock table: $LOCK_TABLE"
+          aws dynamodb delete-table --table-name "$LOCK_TABLE" || true
+          
+          echo "✅ Backend cleanup completed"
+
+  post_destroy_verification:
+    runs-on: ubuntu-latest
+    needs: destroy_resources
+    if: ${{ always() && needs.destroy_resources.result == 'success' }}
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Verify resource destruction
+        run: |
+          echo "🔍 Verifying resource destruction..."
+          
+          # Check for remaining instances
+          INSTANCES=$(aws ec2 describe-instances --filters "Name=tag:Environment,Values=${{ github.event.inputs.environment }}" "Name=instance-state-name,Values=running,pending,stopping,stopped" --query 'Reservations[].Instances[].InstanceId' --output text || true)
+          if [ -n "$INSTANCES" ]; then
+            echo "⚠️ WARNING: Found remaining instances: $INSTANCES"
+          else
+            echo "✅ No instances found"
+          fi
+          
+          # Check for S3 buckets (if scope was everything)
+          if [ "${{ github.event.inputs.destroy_scope }}" = "everything" ] || [ "${{ github.event.inputs.destroy_scope }}" = "s3-only" ]; then
+            BUCKETS=$(aws s3api list-buckets --query 'Buckets[?contains(Name, `jdk-installers`)].Name' --output text || true)
+            if [ -n "$BUCKETS" ]; then
+              echo "⚠️ WARNING: Found remaining S3 buckets: $BUCKETS"
+            else
+              echo "✅ No JDK installer buckets found"
+            fi
+          fi
+          
+          # Check for VPCs (if scope included networking)
+          if [ "${{ github.event.inputs.destroy_scope }}" = "everything" ] || [ "${{ github.event.inputs.destroy_scope }}" = "all-except-s3" ]; then
+            VPCS=$(aws ec2 describe-vpcs --filters "Name=tag:Environment,Values=${{ github.event.inputs.environment }}" --query 'Vpcs[?IsDefault==`false`].VpcId' --output text || true)
+            if [ -n "$VPCS" ]; then
+              echo "⚠️ WARNING: Found remaining VPCs: $VPCS"
+            else
+              echo "✅ No custom VPCs found"
+            fi
+          fi
+          
+          echo "🎯 Destroy verification completed"
+
+  send_notification:
+    runs-on: ubuntu-latest
+    needs: [destroy_resources, post_destroy_verification]
+    if: ${{ always() }}
+    steps:
+      - name: Send success notification
+        if: ${{ needs.destroy_resources.result == 'success' }}
+        run: |
+          echo "✅ DESTRUCTION COMPLETED SUCCESSFULLY"
+          echo "Scope: ${{ github.event.inputs.destroy_scope }}"
+          echo "Environment: ${{ github.event.inputs.environment }}"
+          echo "Timestamp: $(date)"
+          echo ""
+          echo "Next steps:"
+          echo "1. Verify AWS console for remaining resources"
+          echo "2. Check backup data if needed for restoration"
+          echo "3. Update any dependent systems or documentation"
+
+      - name: Send failure notification
+        if: ${{ needs.destroy_resources.result == 'failure' }}
+        run: |
+          echo "❌ DESTRUCTION FAILED"
+          echo "Scope: ${{ github.event.inputs.destroy_scope }}"
+          echo "Environment: ${{ github.event.inputs.environment }}"
+          echo "Timestamp: $(date)"
+          echo ""
+          echo "Required actions:"
+          echo "1. Check the workflow logs for specific errors"
+          echo "2. Manually verify resource states in AWS console"
+          echo "3. Consider manual cleanup if needed"
+          echo "4. Check Terraform state for inconsistencies"
