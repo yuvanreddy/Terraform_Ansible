@@ -9,15 +9,7 @@ output "s3_bucket_arn" {
   value       = var.create_s3_bucket ? aws_s3_bucket.jdk_installers[0].arn : "arn:aws:s3:::${var.s3_bucket_name}"
 }
 
-output "s3_key" {
-  description = "S3 key of the uploaded JDK installer (normalized to .msi)."
-
-  # If Terraform created the aws_s3_object, return its actual key.
-  # Otherwise return a computed default based on local_installer_path but normalize any .exe -> .msi.
-  value = length(aws_s3_object.jdk_installer) > 0 ?
-    aws_s3_object.jdk_installer[0].key :
-    "installers/${replace(basename(var.local_installer_path), \".exe\", \".msi\")}"
-}
+output "s3_key" { description = "S3 key of the uploaded JDK installer" value = length(aws_s3_object.jdk_installer) > 0 ? aws_s3_object.jdk_installer[0].key : "installers/OpenJDK21U-jdk_x64_windows_hotspot_21.0.8_9.exe" }
 
 
 # VPC Outputs
