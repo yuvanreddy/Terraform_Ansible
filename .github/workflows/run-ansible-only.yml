@@ -80,6 +80,12 @@ jobs:
           else
             S3_KEY=$(terraform output -raw s3_key 2>/dev/null || echo "")
           fi
+
+          # If s3_key is still empty, set a default to the uploaded .msi installer
+          if [ -z "$S3_KEY" ]; then
+            S3_KEY="installers/OpenJDK21U-jdk_x64_windows_hotspot_21.0.8_9.msi"
+            echo "No s3_key provided; defaulting to $S3_KEY"
+          fi
           
           echo "instance_ids=$INSTANCE_IDS" >> $GITHUB_OUTPUT
           echo "bucket=$BUCKET" >> $GITHUB_OUTPUT
